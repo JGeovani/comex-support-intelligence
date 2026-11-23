@@ -206,6 +206,13 @@ A successful execution returns:
 
 This test verifies connectivity and executes a SQL query. It does not create or modify business records.
 
+### Connection Test Evidence
+
+The following screenshot demonstrates a successful
+connection between Python and PostgreSQL.
+
+![Successful Python–PostgreSQL connection](docs/screenshots/postgresql-connection-success.png)
+
 ## Repository Structure
 
 ```text
