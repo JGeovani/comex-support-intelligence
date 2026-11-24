@@ -1,6 +1,6 @@
 # Data Model — Comex Support Intelligence
 
-**Status:** Conceptual and logical design (Day 2, Step 1)  
+**Status:** Approved conceptual and logical design (Day 2, Step 1)  
 **Database target:** PostgreSQL 17  
 **Scope:** Fictional foreign-trade technical support, data quality and operational analytics  
 **Implementation:** Design only. No database tables or SQL scripts are created by this document.
@@ -85,8 +85,10 @@ Types below describe the intended PostgreSQL physical implementation. Primary-ke
 | `shipment_id` | BIGINT | NOT NULL, FK → shipments |
 | `document_type` | VARCHAR(30) | NOT NULL; controlled vocabulary |
 | `document_number` | VARCHAR(80) | Nullable |
-| `document_status` | VARCHAR(20) | NOT NULL; vocabulary to be finalized before implementation |
+| `document_status` | VARCHAR(20) | NOT NULL; PENDING, RECEIVED, VALIDATED, REJECTED |
 | `created_at` | TIMESTAMPTZ | NOT NULL; default current timestamp |
+
+**Allowed document statuses:** `PENDING`, `RECEIVED`, `VALIDATED`, `REJECTED`.
 
 **Initial document types:** `COMMERCIAL_INVOICE`, `PACKING_LIST`, `BILL_OF_LADING`.
 
@@ -97,13 +99,15 @@ Types below describe the intended PostgreSQL physical implementation. Primary-ke
 | Column | Type | Constraints / meaning |
 |---|---|---|
 | `staging_id` | BIGINT | Primary key |
-| `source_row_number` | INTEGER | Source row number; nullable for non-file imports |
+| `batch_id` | UUID | NOT NULL; shared by all rows of one import |
+| `source_file` | TEXT | Nullable for non-file imports; source file name |
+| `source_row_number` | INTEGER | Positive when present; nullable for non-file imports |
 | `shipment_reference` | TEXT | Nullable; raw value |
 | `customer_code` | TEXT | Nullable; raw value |
 | `departure_date_raw` | TEXT | Nullable; raw value |
 | `arrival_date_raw` | TEXT | Nullable; raw value |
 | `status_raw` | TEXT | Nullable; raw value |
-| `raw_payload` | JSONB | Original record; recommended NOT NULL |
+| `raw_payload` | JSONB | Original record; NOT NULL |
 | `loaded_at` | TIMESTAMPTZ | NOT NULL; default current timestamp |
 
 **Rationale:** Raw fields use TEXT so malformed values are not rejected before validation. JSONB preserves additional original attributes. Staging must not enforce validated shipment rules.
@@ -116,14 +120,15 @@ Types below describe the intended PostgreSQL physical implementation. Primary-ke
 | `staging_id` | BIGINT | Nullable, FK → shipment_staging |
 | `shipment_id` | BIGINT | Nullable, FK → shipments |
 | `rule_code` | VARCHAR(50) | NOT NULL |
-| `severity` | VARCHAR(10) | NOT NULL; controlled vocabulary |
+| `severity` | VARCHAR(10) | NOT NULL; CRITICAL, HIGH, MEDIUM, LOW |
+| `affected_field` | VARCHAR(80) | Nullable; field or document type affected by the rule |
 | `description` | TEXT | NOT NULL |
 | `detected_at` | TIMESTAMPTZ | NOT NULL; default current timestamp |
 | `resolved_at` | TIMESTAMPTZ | Nullable |
 
 **Planned rule codes:** `DUPLICATE_REFERENCE`, `INVALID_DATE_ORDER`, `MISSING_REQUIRED_FIELD`, `INVALID_STATUS`, `MISSING_REQUIRED_DOCUMENT`.
 
-**Integrity decision:** At least one of `staging_id` and `shipment_id` must be non-null. Both may be present if the finding legitimately relates to both records. The precise severity vocabulary will be finalized with the SQL schema.
+**Integrity decision:** At least one of `staging_id` and `shipment_id` must be non-null. Both may be present if the finding legitimately relates to both records. Severity describes data impact, not ticket urgency. Use `CRITICAL`, `HIGH`, `MEDIUM`, and `LOW`.
 
 ### 3.6 `tickets`
 
@@ -147,7 +152,7 @@ Types below describe the intended PostgreSQL physical implementation. Primary-ke
 
 **Rationale:** A customer can request support without referencing a specific shipment or quality issue. The current status is stored on the ticket for operational queries.
 
-**Consistency consideration:** When `shipment_id` is present, the referenced shipment should belong to `customer_id`. This cross-record invariant must be enforced or checked in the implementation design.
+**Consistency consideration:** When `shipment_id` is present, the referenced shipment should belong to `customer_id`. Enforce this invariant with a composite foreign key from tickets (shipment_id, customer_id) to a unique pair in shipments. The customer foreign key remains mandatory even when shipment_id is null. The Python service must additionally validate issue/shipment/customer consistency, including the staging customer code when available; unresolved ownership must not be silently attributed to another customer.
 
 ### 3.7 `ticket_history`
 
@@ -159,6 +164,7 @@ Types below describe the intended PostgreSQL physical implementation. Primary-ke
 | `new_status` | VARCHAR(20) | NOT NULL; ticket status vocabulary |
 | `change_note` | TEXT | Nullable |
 | `changed_at` | TIMESTAMPTZ | NOT NULL; default current timestamp |
+| `changed_by` | VARCHAR(100) | NOT NULL; nonblank simulated actor, not an authenticated identity |
 
 **Rationale:** Ticket history preserves a trace of state changes. Future application logic must update the ticket and insert its history record in the **same database transaction**.
 
@@ -200,14 +206,62 @@ Types below describe the intended PostgreSQL physical implementation. Primary-ke
 
 This scenario illustrates intended relationships; it is not seeded into the database at this stage.
 
-## 7. Open decisions before physical schema implementation
+## 7. Approved architecture decisions
 
-- Final allowed values for `documents.document_status` and `data_quality_issues.severity`.
-- Whether and how to enforce ticket/customer/shipment consistency at database level.
-- Whether `shipment_staging` needs a batch identifier for repeated imports.
-- Whether to prevent duplicate unresolved findings for the same source record and rule.
-- Whether to add additional checks for country-code formatting and timestamp chronology.
+### 7.1 Controlled vocabularies
 
-## 8. Next step (not yet implemented)
+Use VARCHAR with CHECK constraints for shipment status, document type and status, issue severity, ticket priority and status, and history status values. Document status: PENDING (awaiting receipt), RECEIVED, VALIDATED, REJECTED. Issue severity: CRITICAL, HIGH, MEDIUM, LOW, in descending impact. A missing mandatory document or a pending mandatory document can trigger a quality finding under the simulated business rule; document type identifies the affected item. Severity and ticket priority are independent concepts.
 
-After reviewing and approving this document, translate the logical model into `database/schema.sql`, then separately prepare fictional seed/staging data. No SQL migration, table creation, or sample-data loading is performed by this documentation commit.
+### 7.2 Customer, shipment and ticket consistency
+
+Keep the mandatory customer FK on tickets and use a composite FK (shipment_id, customer_id) referencing a unique pair on shipments. Optional shipment references remain nullable. The service layer must validate the issue association against the ticket customer and shipment when ownership is known. No authentication or additional user table is introduced.
+
+### 7.3 Import batch traceability
+
+Generate one UUID per import and reuse it for every staging row in that batch. Store the source file name when applicable and a positive source row number when available. Detect duplicate references within a batch; repeated references across batches are not automatically duplicate rows within one import, but must be evaluated against validated shipment references. Do not create an eighth table for batches.
+
+### 7.4 Idempotent quality findings
+
+Use partial unique indexes for unresolved findings (resolved_at is null). Maintain one active finding per staging row, rule code and affected field when staging_id is present; otherwise use shipment_id, rule code and affected field. Treat null affected fields as equal (PostgreSQL 17 supports NULLS NOT DISTINCT). When both origins are present, staging is the canonical deduplication origin; shipment is contextual. Use stable affected_field identifiers, including document type where appropriate. A resolved finding may recur as a new finding. Repeated checks must not inflate active issue counts.
+
+### 7.5 Format and chronology
+
+Require nonblank customer name/code, shipment reference, ticket title/description and history actor. Country codes must contain exactly two uppercase ASCII letters; this validates format, not ISO membership. Arrival date must be on or after departure date when present. Ticket resolution must be on or after creation; issue resolution must be on or after detection. Source row numbers must be positive when supplied. Raw staging values remain permissive.
+
+### 7.6 History actor and traceability
+
+Record changed_by for each history entry (e.g., analyst_01 or system). It is a simulated actor label, not proof of authentication. Record the initial entry with null previous_status and OPEN as new_status. Preserve history and update current status and history atomically in the application transaction.
+
+### 7.7 Ticket lifecycle
+
+The MVP permits only OPEN → IN_ANALYSIS → RESOLVED → CLOSED. No reopening or skipped transitions. The application service validates transitions and records history in the same transaction. resolved_at must be null for OPEN and IN_ANALYSIS and non-null for RESOLVED and CLOSED. Set it at resolution and preserve it at administrative closure. Priority remains fixed during the ticket lifecycle. Row-level constraints enforce status/timestamp consistency; transition and history consistency are service-layer responsibilities.
+
+### 7.8 Resolution SLA
+
+| Priority | Target (elapsed calendar hours) |
+|---|---:|
+| P1 | 4 |
+| P2 | 8 |
+| P3 | 24 |
+| P4 | 72 |
+
+Start at created_at; stop at resolved_at, or use the current time for unresolved tickets. Resolution at the deadline meets SLA; elapsed time greater than the target breaches it. Administrative closure does not reset the clock. Derive elapsed time and SLA indicators rather than storing a changing duration. No business-hours calendar or priority changes in the MVP.
+
+## 8. Approved model summary
+
+| Entity | Columns |
+|---|---:|
+| customers | 5 |
+| shipments | 9 |
+| documents | 6 |
+| shipment_staging | 10 |
+| data_quality_issues | 9 |
+| tickets | 10 |
+| ticket_history | 7 |
+| **Total** | **56** |
+
+All eight architecture decisions were approved. The seven-entity relationship diagram remains unchanged because the additional fields and constraints do not introduce new entities or relationships.
+
+## 9. Next step (not yet implemented)
+
+Translate the approved logical model into database/schema.sql in Day 2, Step 2. Prepare fictional seed/staging data separately. This documentation revision does not create tables, write a SQL schema file, or execute SQL.
