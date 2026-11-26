@@ -254,11 +254,11 @@ Start at created_at; stop at resolved_at, or use the current time for unresolved
 | customers | 5 |
 | shipments | 9 |
 | documents | 6 |
-| shipment_staging | 10 |
+| shipment_staging | 11 |
 | data_quality_issues | 9 |
 | tickets | 10 |
 | ticket_history | 7 |
-| **Total** | **56** |
+| **Total** | **57** |
 
 All eight architecture decisions were approved. The seven-entity relationship diagram remains unchanged because the additional fields and constraints do not introduce new entities or relationships.
 
